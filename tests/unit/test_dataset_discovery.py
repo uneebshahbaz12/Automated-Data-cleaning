@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -53,6 +54,13 @@ class MemoryCatalogRepository:
     def save_version(self, version: DatasetVersion) -> None:
         self.versions.append(version.model_copy(deep=True))
 
+    def update_version(self, version: DatasetVersion) -> None:
+        for index, item in enumerate(self.versions):
+            if item.version_id == version.version_id:
+                self.versions[index] = version.model_copy(deep=True)
+                return
+        raise KeyError(str(version.version_id))
+
     def load_version(self, version_id: UUID) -> DatasetVersion | None:
         return next(
             (item.model_copy(deep=True) for item in self.versions if item.version_id == version_id),
@@ -75,11 +83,13 @@ class FakeAdapter:
         candidates: list[DatasetCandidate],
         *,
         content: bytes = b"date,value\n" + b"2026-01-01,1\n" * 30,
+        content_type: str = "text/csv",
         fail_search: bool = False,
     ) -> None:
         self.source_id = source_id
         self.candidates = {item.candidate_id: item for item in candidates}
         self.content = content
+        self.content_type = content_type
         self.fail_search = fail_search
         self.fetch_count = 0
 
@@ -93,7 +103,7 @@ class FakeAdapter:
 
     def fetch(self, candidate: DatasetCandidate) -> FetchResult:
         self.fetch_count += 1
-        return FetchResult(content=self.content, content_type="text/csv")
+        return FetchResult(content=self.content, content_type=self.content_type)
 
 
 def _candidate(
@@ -178,7 +188,7 @@ def test_selection_requires_explicit_confirmation_and_recommended_candidate(
 def test_shared_cache_is_reused_after_confirmed_selection(tmp_path: Path) -> None:
     candidate = _candidate("official", "temperature")
     adapter = FakeAdapter("official", [candidate])
-    service, _ = _service(tmp_path, [adapter])
+    service, repository = _service(tmp_path, [adapter])
     plan = service.discover(
         uuid4(),
         DatasetSearchQuery(target="temperature", geography=["Pakistan"], frequency="daily"),
@@ -191,7 +201,12 @@ def test_shared_cache_is_reused_after_confirmed_selection(tmp_path: Path) -> Non
     assert first == second
     assert first.shared
     assert adapter.fetch_count == 1
-    assert Path(first.storage_path).read_bytes() == adapter.content
+    assert first.parent_version_id is not None
+    assert Path(first.storage_path).read_bytes() != adapter.content
+    assert Path(first.storage_path).read_bytes().count(b"2026-01-01,1\n") == 1
+    raw = repository.load_version(first.parent_version_id)
+    assert raw is not None
+    assert Path(raw.storage_path).read_bytes() == adapter.content
 
 
 def test_nonredistributable_data_is_user_scoped_and_not_cross_tenant(tmp_path: Path) -> None:
@@ -263,16 +278,53 @@ def test_invalid_or_inadequate_dataset_payloads_fail_closed(
         service.fetch_selection(selection.selection_id)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"date": "2026-01-01", "value": 1}, {"date": "2026-01-02", "value": 2}],
+        [{"page": 1, "pages": 1}, [{"date": "2026-01-01", "value": 1}, {"date": "2026-01-02", "value": 2}]],
+        {"data": [{"date": "2026-01-01", "value": 1}, {"date": "2026-01-02", "value": 2}]},
+        {"features": [{"properties": {"value": 1}}, {"properties": {"value": 2}}]},
+        {"date": ["2026-01-01", "2026-01-02"], "value": [1, 2]},
+    ],
+)
+def test_common_json_dataset_shapes_are_accepted(
+    tmp_path: Path, payload: object
+) -> None:
+    candidate = _candidate("json-source", "temperature")
+    content = json.dumps(payload).encode("utf-8")
+    service, _ = _service(
+        tmp_path,
+        [FakeAdapter("json-source", [candidate], content=content, content_type="application/json")],
+    )
+    plan = service.discover(
+        uuid4(),
+        DatasetSearchQuery(
+            target="temperature",
+            geography=["Pakistan"],
+            frequency="daily",
+            minimum_training_points=2,
+        ),
+    )
+    selection = service.confirm_dataset(plan.plan_id, candidate.candidate_id, confirm=True)
+    version = service.fetch_selection(selection.selection_id)
+    assert version.metadata["cleaning_status"] == "completed"
+
+
 def test_normalized_derivative_preserves_raw_parent_lineage(tmp_path: Path) -> None:
     candidate = _candidate("official", "temperature")
     adapter = FakeAdapter("official", [candidate])
-    service, _ = _service(tmp_path, [adapter])
+    service, repository = _service(tmp_path, [adapter])
     plan = service.discover(
         uuid4(),
         DatasetSearchQuery(target="temperature", geography=["Pakistan"], frequency="daily"),
     )
     selection = service.confirm_dataset(plan.plan_id, candidate.candidate_id, confirm=True)
-    raw = service.fetch_selection(selection.selection_id)
+    cleaned = service.fetch_selection(selection.selection_id)
+    raw_id = cleaned.parent_version_id
+    assert raw_id is not None
+    raw = repository.load_version(raw_id)
+    assert raw is not None
 
     normalized = service.store_derived_version(
         raw.version_id,

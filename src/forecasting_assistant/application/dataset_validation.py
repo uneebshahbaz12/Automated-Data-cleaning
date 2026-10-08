@@ -19,18 +19,24 @@ class DatasetPayloadValidationError(ValueError):
 
 def _json_point_count(payload: Any) -> int | None:
     if isinstance(payload, list):
-        if len(payload) == 2 and isinstance(payload[0], dict) and isinstance(payload[1], list):
-            return len(payload[1])
-        return len(payload)
+        # World Bank-style responses are [metadata, [records...]].
+        if len(payload) == 2 and isinstance(payload[1], list):
+            records = payload[1]
+            return len(records) if all(isinstance(row, Mapping) for row in records) else None
+        return len(payload) if all(isinstance(row, Mapping) for row in payload) else None
     if not isinstance(payload, Mapping):
         return None
     features = payload.get("features")
     if isinstance(features, list):
-        return len(features)
+        return len(features) if all(isinstance(row, Mapping) for row in features) else None
     for key in ("data", "results", "value", "items", "messages"):
         values = payload.get(key)
         if isinstance(values, list):
-            return len(values)
+            return len(values) if all(isinstance(row, Mapping) for row in values) else None
+        if isinstance(values, Mapping):
+            nested_count = _json_point_count(values)
+            if nested_count is not None:
+                return nested_count
     properties = payload.get("properties")
     if isinstance(properties, Mapping):
         parameter = properties.get("parameter")
@@ -40,6 +46,15 @@ def _json_point_count(payload: Any) -> int | None:
             ]
             if series_lengths:
                 return max(series_lengths)
+    values = list(payload.values())
+    if values and all(isinstance(value, list) for value in values):
+        lengths = {len(value) for value in values}
+        if len(lengths) == 1:
+            return lengths.pop()
+    # A single JSON object is a valid one-row dataset. The minimum-point
+    # requirement will still reject it when the forecasting request needs more.
+    if payload:
+        return 1
     return None
 
 

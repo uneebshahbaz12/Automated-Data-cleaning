@@ -59,6 +59,9 @@ class DatasetCatalogRepository(Protocol):
     def save_version(self, version: DatasetVersion) -> None:
         raise NotImplementedError
 
+    def update_version(self, version: DatasetVersion) -> None:
+        raise NotImplementedError
+
     def load_version(self, version_id: UUID) -> DatasetVersion | None:
         raise NotImplementedError
 

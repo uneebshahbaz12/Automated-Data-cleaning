@@ -307,7 +307,18 @@ function renderRequirements() {
 function renderCatalog() {
   if (!sourcePlan) { panel.innerHTML = '<p class="empty">Confirm your requirements first. Matching datasets will appear here.</p>'; return; }
   const items = sourcePlan.recommendations || [];
-  if (!items.length) { panel.innerHTML = '<p class="empty">I couldn’t find an eligible dataset for this request yet.</p><div class="notice">You can go back to the conversation and adjust the forecast details, or upload your own data.</div>'; return; }
+  if (!items.length) {
+    const unavailable = sourcePlan.unavailable_alternatives || [];
+    const errors = Object.entries(sourcePlan.source_errors || {});
+    const reasons = unavailable.slice(0, 5).map(item => {
+      const title = item.candidate?.title || 'Catalog candidate';
+      const details = (item.ranking?.rejection_reasons || []).join('; ');
+      return `<div class="catalog-card"><h3>${esc(title)}</h3><p class="error">${esc(details || 'Not eligible for this request.')}</p></div>`;
+    }).join('');
+    const sourceErrors = errors.map(([source, error]) => `<div class="catalog-card"><h3>${esc(source)}</h3><p class="error">${esc(error)}</p></div>`).join('');
+    panel.innerHTML = `<p class="empty">I couldn’t find an eligible dataset for this request yet.</p><div class="notice">Try a broader target description, choose a supported public source, or upload your own CSV/JSON file.</div>${reasons ? `<h3>Why candidates were rejected</h3>${reasons}` : ''}${sourceErrors ? `<h3>Sources with errors</h3>${sourceErrors}` : ''}`;
+    return;
+  }
   panel.innerHTML = `<div class="meta">Choose one dataset to continue.</div>${items.map(item => { const c=item.candidate, r=item.ranking, url=(c.source_url.startsWith('http://') || c.source_url.startsWith('https://')) ? c.source_url : '#'; return `<div class="catalog-card"><h3>${esc(c.title)}</h3><p>${esc(c.description || 'Catalog dataset from a trusted source.')}</p><div class="meta">${esc(c.publisher)}${c.frequency ? ` · ${esc(c.frequency)}` : ''}${r.total ? ` · Match ${esc(r.total)}/100` : ''}</div><div class="catalog-footer"><a class="link" href="${esc(url)}" target="_blank" rel="noopener">Preview details ↗</a><button class="primary" onclick="selectDataset('${esc(sourcePlan.plan_id)}','${esc(c.candidate_id)}')">Use this dataset</button></div></div>`; }).join('')}${selection ? `<div class="notice"><strong>Dataset selected.</strong><br><span class="meta">It is ready to fetch when you are.</span><br><button class="primary" onclick="fetchDataset('${esc(selection.selection_id)}')">Fetch dataset</button></div>` : ''}`;
 }
 async function selectDataset(planId, candidateId) {
@@ -321,8 +332,12 @@ async function selectDataset(planId, candidateId) {
 async function fetchDataset(selectionId) {
   try {
     const data = await api(`/api/dataset-selections/${selectionId}/fetch`, {method:'POST'});
-    panel.innerHTML = `<div class="notice"><strong>Your dataset is ready.</strong><br><span class="meta">It has been safely stored for the next forecasting step. Retrieved ${esc(data.version.retrieved_at || 'now')}.</span></div>`;
-    addBubble('The dataset is ready for the next step in the forecasting pipeline.', 'assistant');
+    const version = data.version || {};
+    const metadata = version.metadata || {};
+    const report = metadata.cleaning_report || {};
+    const status = metadata.cleaning_status || 'not_run';
+    panel.innerHTML = `<div class="notice"><strong>Your dataset is ready.</strong><br><span class="meta">It has been safely stored for the next forecasting step. Retrieved ${esc(version.retrieved_at || 'now')}.</span><br><br><strong>Automatic cleaning</strong><br><span class="meta">Status: ${esc(status)} · Valid: ${esc(report.valid === undefined ? 'unknown' : report.valid ? 'yes' : 'no')}<br>Rows: ${esc(report.rows_before ?? 'unknown')} → ${esc(report.rows_after ?? 'unknown')}<br>Exact duplicates removed: ${esc(report.exact_duplicates_removed ?? 0)}<br>Missing values filled: ${esc(report.missing_values_filled ?? 0)}</span>${version.parent_version_id ? `<br><span class="meta">Raw parent preserved: ${esc(version.parent_version_id)}</span>` : ''}</div>`;
+    addBubble(`The dataset was fetched. Automatic cleaning status: ${status}.`, 'assistant');
   } catch (error) { panel.innerHTML = `<p class="error">${esc(error.message)}</p>`; }
 }
 function uploadData(file) {

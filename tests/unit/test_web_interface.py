@@ -23,6 +23,10 @@ def test_dashboard_html_exposes_demo_panels() -> None:
     assert "Upload data" in html
     assert "Data catalog" in html
     assert "Fetch dataset" in html
+    assert "Automatic cleaning" in html
+    assert "Exact duplicates removed" in html
+    assert "Missing values filled" in html
+    assert "Why candidates were rejected" in html
     assert "/api/dialogues" in html
     assert "sessionStorage" in html
     assert "[trace]" not in html

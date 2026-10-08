@@ -164,6 +164,28 @@ class SQLiteDatasetCatalogRepository:
                 ),
             )
 
+    def update_version(self, version: DatasetVersion) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE dataset_versions
+                SET candidate_id = ?, cache_key = ?, user_id = ?, shared = ?,
+                    version_json = ?, retrieved_at = ?
+                WHERE version_id = ?
+                """,
+                (
+                    version.candidate_id,
+                    version.cache_key,
+                    version.user_id,
+                    int(version.shared),
+                    version.model_dump_json(),
+                    version.retrieved_at.isoformat(),
+                    str(version.version_id),
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"dataset version does not exist: {version.version_id}")
+
     def load_version(self, version_id: UUID) -> DatasetVersion | None:
         with self._connect() as connection:
             row = connection.execute(

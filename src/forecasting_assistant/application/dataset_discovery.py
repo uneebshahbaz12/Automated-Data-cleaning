@@ -3,9 +3,15 @@ from __future__ import annotations
 import io
 import zipfile
 from datetime import UTC, datetime, timedelta
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from uuid import UUID
 
+from forecasting_assistant.application.cleaning import (
+    UnsupportedDatasetFormatError,
+    build_cleaning_plan,
+    execute_cleaning_plan,
+    profile_dataset,
+)
 from forecasting_assistant.application.dataset_query import query_from_specification
 from forecasting_assistant.application.dataset_ranking import DatasetRanker, ranking_sort_key
 from forecasting_assistant.application.dataset_validation import validate_dataset_payload
@@ -182,7 +188,12 @@ class DatasetDiscoveryService:
         cached = self._repository.find_cached_version(cache_key, user_id=selection.user_id)
         plan = self._repository.load_plan(selection.plan_id)
         if cached is not None and self._cache_is_fresh(cached, candidate, plan):
-            return cached
+            cleaning_version_id = cached.metadata.get("cleaning_version_id")
+            if cleaning_version_id:
+                cleaned = self._repository.load_version(UUID(str(cleaning_version_id)))
+                if cleaned is not None:
+                    return cleaned
+            return self._clean_version(cached, plan)
 
         try:
             adapter = self._adapters[candidate.adapter_id]
@@ -218,7 +229,72 @@ class DatasetDiscoveryService:
         self._repository.save_version(version)
         selection.status = SelectionStatus.FETCHED
         self._repository.save_selection(selection)
-        return version
+        return self._clean_version(version, plan)
+
+    def _clean_version(
+        self,
+        raw_version: DatasetVersion,
+        plan: SourcePlan | None,
+    ) -> DatasetVersion:
+        existing_cleaning_id = raw_version.metadata.get("cleaning_version_id")
+        if existing_cleaning_id:
+            cleaned = self._repository.load_version(UUID(str(existing_cleaning_id)))
+            if cleaned is not None:
+                return cleaned
+
+        filename = str(raw_version.metadata.get("filename") or "")
+        if not filename:
+            source_url = str(raw_version.metadata.get("source_url") or "")
+            filename = PurePosixPath(source_url.split("?", 1)[0]).name
+        if "." not in filename:
+            filename = "dataset.csv" if raw_version.content_type == "text/csv" else "dataset.json"
+
+        raw_content = Path(raw_version.storage_path).read_bytes()
+        target = plan.query.target if plan is not None else None
+        try:
+            profile, _ = profile_dataset(
+                raw_content,
+                filename=filename,
+                target_column=target,
+            )
+        except UnsupportedDatasetFormatError:
+            raw_version.metadata = {
+                **raw_version.metadata,
+                "cleaning_status": "unsupported_format",
+            }
+            self._repository.update_version(raw_version)
+            return raw_version
+
+        cleaning_plan = build_cleaning_plan(profile)
+        cleaned_content, final_profile, report = execute_cleaning_plan(
+            raw_content,
+            filename=filename,
+            plan=cleaning_plan,
+            target_column=profile.target_column,
+            time_column=profile.time_column,
+        )
+        cleaned = self.store_derived_version(
+            raw_version.version_id,
+            cleaned_content,
+            content_type="text/csv",
+            user_id=raw_version.user_id,
+            metadata={
+                "cleaning_status": "completed",
+                "raw_version_id": str(raw_version.version_id),
+                "profile": profile.model_dump(mode="json"),
+                "final_profile": final_profile.model_dump(mode="json"),
+                "cleaning_plan": cleaning_plan.model_dump(mode="json"),
+                "cleaning_report": report.model_dump(mode="json"),
+            },
+        )
+        raw_version.metadata = {
+            **raw_version.metadata,
+            "cleaning_status": "completed",
+            "cleaning_version_id": str(cleaned.version_id),
+            "cleaning_report": report.model_dump(mode="json"),
+        }
+        self._repository.update_version(raw_version)
+        return cleaned
 
     def store_derived_version(
         self,
